@@ -15,6 +15,7 @@ import {
 } from "../api";
 import { NEAR_GAS_RESERVE, NET } from "../config";
 import { fmtAmount, fmtNum, fmtPriceInput, fmtUsd, minOutAt, orient, defaultBase, type Base } from "../pricing";
+import { storedReferrer } from "../referral";
 import { useWallet } from "../wallet";
 import { TokenSelect } from "./TokenSelect";
 
@@ -213,7 +214,7 @@ export function TradePanel({
               min_out_per_swap: guardMinOut > 0n ? guardMinOut.toString() : null,
               start_at_sec: null,
             };
-      const txs = await buildPlaceOrderTxs(accountId, config, tokenIn.id, tokenOut.id, deposit, request);
+      const txs = await buildPlaceOrderTxs(accountId, config, tokenIn.id, tokenOut.id, deposit, request, storedReferrer());
       await send(txs);
       setMsg({ kind: "ok", text: mode === "limit" ? "Limit order placed. Your exit is set." : "DCA plan started." });
       setAmountStr("");

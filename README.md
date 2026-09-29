@@ -116,6 +116,37 @@ npm run dev
 If the contract isn't deployed yet, the app still loads live Ref quotes for the
 default meme list. Placing orders stays disabled until the contract is live.
 
+## Indexer & API
+
+The same image runs as a second Railway service with `ROLE=indexer`. It uses Railway
+Postgres, reads every contract event from FastNEAR's transaction API (only settled,
+successful receipts), and serves `readersexit.com/api/*` through a Vercel rewrite:
+
+| Endpoint | Returns |
+|---|---|
+| `/api/stats` | traders, orders, fills, total USD volume |
+| `/api/leaderboard?campaign=<id>` | top 100 by USD volume (all-time without `campaign`) |
+| `/api/campaigns` | campaigns with `upcoming` / `active` / `ended` status |
+| `/api/profile/<account>` | volume, fills, fees, referrer, referral earnings, campaign rank |
+| `/api/history/<account>?before=<iso>` | the account's events, newest first |
+| `/api/referrals/<account>` | traders referred, their volume, what you earned |
+
+**Volume rule** (resists wash trading and manipulated prices): a fill against
+NEAR/USDt/USDC counts the NEAR/stable amount actually moved. Meme-to-meme fills count
+the lower of the two sides. Anything that can't be priced on both sides counts as zero.
+
+**Competitions** are one-off campaigns in the indexer's `CAMPAIGNS` variable (JSON, see
+`keeper/.env.example`). Edit it in Railway and the leaderboard updates without a code
+deploy. Prizes are paid manually.
+
+## Referrals
+
+`?ref=<account>` links are remembered in the browser (first link wins). They're bound
+on-chain by `set_referrer` in the user's next contract transaction. The user always
+signs it themselves, so order messages can never bind a referrer (malicious tokens
+could spoof them). From then on, `referral_share_bps` (default 5000 = half) of the 1%
+fee on every fill goes straight to the referrer's claimable balance.
+
 ## Notes
 
 - Execution and quotes use Ref v2 (`v2.ref-finance.near`) `swap` / `get_return`.

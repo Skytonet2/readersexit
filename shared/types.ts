@@ -34,6 +34,8 @@ export interface Config {
   open_orders: number;
   min_account_storage: string;
   order_storage: string;
+  /** Share of the protocol fee paid to referrers (5000 = half). */
+  referral_share_bps: number;
 }
 
 export interface StorageBalance {

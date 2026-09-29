@@ -7,4 +7,5 @@ COPY shared ./shared
 COPY keeper/tsconfig.json ./keeper/
 COPY keeper/src ./keeper/src
 WORKDIR /app/keeper
-CMD ["npx", "tsx", "src/index.ts"]
+# ROLE=keeper (default) or ROLE=indexer; see src/main.ts.
+CMD ["npx", "tsx", "src/main.ts"]

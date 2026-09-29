@@ -24,6 +24,8 @@ export const getTokenIds = () => rx<string[]>("get_tokens");
 export const getAccountOrders = (account_id: string) => rx<Order[]>("get_account_orders", { account_id });
 export const getBalances = (account_id: string) => rx<TokenBalance[]>("get_balances", { account_id });
 export const getStorage = (account_id: string) => rx<StorageBalance | null>("storage_balance_of", { account_id });
+export const getReferrer = (account_id: string) =>
+  rx<string | null>("get_referrer", { account_id }).catch(() => null);
 
 export async function getAllOrders(): Promise<Order[]> {
   const all: Order[] = [];
@@ -138,8 +140,10 @@ export async function buildPlaceOrderTxs(
   tokenOut: string,
   amount: bigint,
   request: OrderRequest,
+  referrer: string | null = null,
 ): Promise<Tx[]> {
   const txs: Tx[] = [];
+  const contractActions: Action[] = [];
 
   // 1. readersEXIT storage (refundable NEAR deposit).
   const storage = await getStorage(account);
@@ -147,9 +151,13 @@ export async function buildPlaceOrderTxs(
   let need = 0n;
   if (!storage) need = BigInt(config.min_account_storage) + orderStorage;
   else if (BigInt(storage.available) < orderStorage) need = orderStorage - BigInt(storage.available);
-  if (need > 0n) {
-    txs.push({ receiverId: CONTRACT_ID, actions: [fc("storage_deposit", {}, 10n, need)] });
+  if (need > 0n) contractActions.push(fc("storage_deposit", {}, 10n, need));
+
+  // Bind a stored referral link (user-signed; the contract ignores it if already bound).
+  if (referrer && referrer !== account && !(await getReferrer(account))) {
+    contractActions.push(fc("set_referrer", { referrer_id: referrer }, 10n, 0n));
   }
+  if (contractActions.length) txs.push({ receiverId: CONTRACT_ID, actions: contractActions });
 
   // 2. Make sure proceeds can be withdrawn later.
   const outReg = await ensureTokenStorage(tokenOut, account);
