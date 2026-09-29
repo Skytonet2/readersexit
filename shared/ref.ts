@@ -20,9 +20,18 @@ export interface Quote {
   route: RouteHop[];
   path: string[];
   amountOut: bigint;
+  /** Highest pool fee along the route, in bps. */
+  maxPoolFeeBps: number;
+  /**
+   * Loss from pool depth alone, in bps: this trade's rate vs a tiny trade on the same
+   * route (fees cancel out). 10000 = the pool can't absorb the trade at all.
+   */
+  priceImpactBps: number;
 }
 
 const PAGE = 1000;
+/** Pools charging more than this are ignored (normal Ref pools: 1–30 bps; traps: 2000+). */
+export const DEFAULT_MAX_POOL_FEE_BPS = 100;
 
 export class RefRouter {
   private pools: RefPool[] = [];
@@ -35,6 +44,7 @@ export class RefRouter {
     private refId: string,
     private hubs: string[],
     private ttlMs = 10 * 60_000,
+    private maxPoolFeeBps = DEFAULT_MAX_POOL_FEE_BPS,
   ) {}
 
   async load(force = false): Promise<void> {
@@ -78,15 +88,35 @@ export class RefRouter {
     return this.loading;
   }
 
-  /** Pools containing both tokens, deepest (by reserve of `a`) first. */
+  /**
+   * Candidate pools holding both tokens: the deepest by each side's reserve (a pool can
+   * be deep in one token and nearly empty in the other). High-fee pools are excluded.
+   */
   poolsBetween(a: string, b: string, limit = 3): RefPool[] {
-    return (this.byToken.get(a) ?? [])
-      .filter((p) => p.token_account_ids.includes(b))
-      .sort((x, y) => {
-        const d = reserve(y, a) - reserve(x, a);
-        return d > 0n ? 1 : d < 0n ? -1 : 0;
-      })
-      .slice(0, limit);
+    const pools = (this.byToken.get(a) ?? []).filter(
+      (p) => p.token_account_ids.includes(b) && p.total_fee <= this.maxPoolFeeBps,
+    );
+    const deepest = (t: string) =>
+      [...pools]
+        .sort((x, y) => {
+          const d = reserve(y, t) - reserve(x, t);
+          return d > 0n ? 1 : d < 0n ? -1 : 0;
+        })
+        .slice(0, limit);
+    return [...new Set([...deepest(a), ...deepest(b)])];
+  }
+
+  /** Output of a fixed route for `amountIn` (0 if any hop fails). */
+  async quoteRoute(tokenIn: string, route: RouteHop[], amountIn: bigint): Promise<bigint> {
+    let amount = amountIn;
+    let token = tokenIn;
+    for (const hop of route) {
+      const pool = this.pools.find((p) => p.id === hop.pool_id);
+      if (!pool || amount <= 0n) return 0n;
+      amount = await this.getReturn(pool, token, amount, hop.token_out);
+      token = hop.token_out;
+    }
+    return amount;
   }
 
   hasToken(token: string): boolean {
@@ -111,7 +141,7 @@ export class RefRouter {
   async quote(tokenIn: string, tokenOut: string, amountIn: bigint): Promise<Quote | null> {
     await this.load();
     if (amountIn <= 0n || tokenIn === tokenOut) return null;
-    const candidates: Promise<Quote>[] = [];
+    const candidates: Promise<Omit<Quote, "maxPoolFeeBps" | "priceImpactBps">>[] = [];
 
     for (const pool of this.poolsBetween(tokenIn, tokenOut)) {
       candidates.push(
@@ -145,8 +175,18 @@ export class RefRouter {
     }
 
     const quotes = await Promise.all(candidates);
-    const best = quotes.reduce<Quote | null>((b, q) => (!b || q.amountOut > b.amountOut ? q : b), null);
-    return best && best.amountOut > 0n ? best : null;
+    const best = quotes.reduce<(typeof quotes)[number] | null>((b, q) => (!b || q.amountOut > b.amountOut ? q : b), null);
+    if (!best || best.amountOut <= 0n) return null;
+
+    const maxPoolFeeBps = Math.max(...best.route.map((h) => this.pools.find((p) => p.id === h.pool_id)?.total_fee ?? 0));
+    const probe = amountIn / 1000n > 0n ? amountIn / 1000n : 1n;
+    const probeOut = await this.quoteRoute(tokenIn, best.route, probe);
+    let priceImpactBps = 10_000;
+    if (probeOut > 0n) {
+      const ratioBps = (best.amountOut * probe * 10_000n) / (probeOut * amountIn);
+      priceImpactBps = Math.max(0, Math.min(10_000, 10_000 - Number(ratioBps)));
+    }
+    return { ...best, maxPoolFeeBps, priceImpactBps };
   }
 }
 

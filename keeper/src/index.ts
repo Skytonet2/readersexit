@@ -18,6 +18,8 @@ const accountId = process.env.KEEPER_ACCOUNT_ID;
 const privateKey = (process.env.KEEPER_PRIVATE_KEY || credentialsKey()) as KeyPairString | undefined;
 const pollMs = Number(process.env.POLL_MS ?? 15_000);
 const slippageBps = BigInt(process.env.SLIPPAGE_BPS ?? 50);
+// DCA slices whose price impact exceeds this are skipped (thin or trap pools).
+const maxImpactBps = Number(process.env.MAX_IMPACT_BPS ?? 1000);
 const dryRun = process.env.DRY_RUN === "1" || !accountId || !privateKey;
 
 const EXECUTE_GAS = 200_000_000_000_000n;
@@ -47,6 +49,14 @@ function required(name: string): string {
 
 function log(...args: unknown[]) {
   console.log(new Date().toISOString(), ...args);
+}
+
+// Skips repeat every tick; log each order's reason at most every 10 minutes.
+const lastSkipLog = new Map<number, number>();
+function logThrottled(orderId: number, message: string) {
+  if (Date.now() - (lastSkipLog.get(orderId) ?? 0) < 10 * 60_000) return;
+  lastSkipLog.set(orderId, Date.now());
+  log(message);
 }
 
 async function decimals(token: string): Promise<number> {
@@ -100,6 +110,14 @@ async function processOrder(order: Order, feeBps: bigint, isKeeper: boolean, now
 
   const quote = await router.quote(order.token_in, order.token_out, amountIn);
   if (!quote) return;
+  if (kind.type === "dca" && quote.priceImpactBps > maxImpactBps) {
+    // Limit orders are protected by the user's price; DCA without a max price is not.
+    return logThrottled(
+      order.id,
+      `order ${order.id}: DCA slice skipped, price impact ${(quote.priceImpactBps / 100).toFixed(1)}% ` +
+        `> ${maxImpactBps / 100}% (pool too thin for this slice size)`,
+    );
+  }
   if (quote.amountOut < userMin) {
     if (kind.type === "dca") log(`order ${order.id}: DCA slice skipped, above max price`);
     return;
@@ -110,7 +128,8 @@ async function processOrder(order: Order, feeBps: bigint, isKeeper: boolean, now
   const decOut = await decimals(order.token_out);
   log(
     `order ${order.id} (${kind.type}): ${quote.path.join(" -> ")} ` +
-      `quote ${formatUnits(quote.amountOut, decOut)} min ${formatUnits(minOut, decOut)}`,
+      `quote ${formatUnits(quote.amountOut, decOut)} min ${formatUnits(minOut, decOut)} ` +
+      `impact ${(quote.priceImpactBps / 100).toFixed(2)}% pool fee ${quote.maxPoolFeeBps / 100}%`,
   );
   await call("execute", { order_id: order.id, route: quote.route, min_amount_out: minOut.toString() });
 }

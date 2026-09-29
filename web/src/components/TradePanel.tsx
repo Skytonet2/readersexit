@@ -36,6 +36,8 @@ const SELL_NUDGES = [0, 5, 10, 25, 50, 100];
 const BUY_NUDGES = [0, 5, 10, 25, 50, 75];
 // DCA price-guard presets, relative to market.
 const GUARD_STEPS = [10, 25, 50];
+// Must match the keeper's MAX_IMPACT_BPS: DCA slices above it are skipped.
+const DCA_MAX_IMPACT_BPS = 1000;
 
 export function TradePanel({
   tokens,
@@ -160,9 +162,14 @@ export function TradePanel({
       if (nBuys < 2) return "At least 2 buys";
       if (perSwap === 0n) return "Amount too small";
       if (intervalSec < 60) return "Interval must be ≥ 1 minute";
+      // The keeper skips slices above this impact, so the order would never fill.
+      if (quote && quote.priceImpactBps > DCA_MAX_IMPACT_BPS) return "Slices too big for the pool — add more buys";
     }
+    if (!quote && !quoting) return "No safe route for this pair";
     return null;
-  }, [tokenIn, tokenOut, amountIn, balance, mode, limitMinOut, nBuys, perSwap, intervalSec]);
+  }, [tokenIn, tokenOut, amountIn, balance, mode, limitMinOut, nBuys, perSwap, intervalSec, quote, quoting]);
+
+  const impactPct = quote ? quote.priceImpactBps / 100 : 0;
 
   // Tokens in this pair that nobody has listed yet (e.g. brand-new launches).
   const unlisted = [tokenIn, tokenOut].filter((t): t is Token => !!t && !listed.has(t.id));
@@ -369,10 +376,31 @@ export function TradePanel({
                 </span>
               </>
             ) : (
-              <span className="muted">no route</span>
+              <span className="muted" title="Pools charging over 1% fee are ignored">
+                no safe route
+              </span>
             )}
           </dd>
         </div>
+        {quote && (
+          <>
+            <div>
+              <dt>{mode === "dca" ? "Price impact / buy" : "Price impact at market"}</dt>
+              <dd className={impactPct >= 15 ? "bad" : impactPct >= 5 ? "down" : ""}>{impactPct.toFixed(2)}%</dd>
+            </div>
+            <div>
+              <dt>Pool fee</dt>
+              <dd>{quote.maxPoolFeeBps / 100}%</dd>
+            </div>
+            {impactPct >= 5 && (
+              <p className={`note ${impactPct >= 15 ? "note--bad" : ""}`}>
+                {mode === "dca"
+                  ? "This pool is thin for your buy size — each buy moves the price a lot. Use more, smaller buys."
+                  : "This pool is thin for your size — a market-price fill would move the price a lot. Your limit price still protects you."}
+              </p>
+            )}
+          </>
+        )}
         {mode === "limit" ? (
           <>
             <div>
