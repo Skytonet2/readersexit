@@ -1,0 +1,9 @@
+# Only the web app and shared code are needed to build the site.
+contract
+keeper
+**/node_modules
+**/dist
+**/.env
+**/.env.local
+*.log
+*.key.json

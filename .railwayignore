@@ -1,0 +1,9 @@
+# Railway only builds the keeper (service var RAILWAY_DOCKERFILE_PATH=keeper/Dockerfile).
+contract
+web
+**/node_modules
+**/dist
+**/.env
+*.log
+.vercel
+*.key.json
