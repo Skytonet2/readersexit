@@ -56,6 +56,8 @@ enum StorageKey {
     Tokens,
     Orders,
     Accounts,
+    // Append only: variants are storage prefixes, reordering would orphan data.
+    Referrers,
 }
 
 #[near(serializers = [borsh, json])]
@@ -181,6 +183,7 @@ pub struct Config {
     pub open_orders: u32,
     pub min_account_storage: U128,
     pub order_storage: U128,
+    pub referral_share_bps: u16,
 }
 
 #[ext_contract(ext_ft)]
@@ -225,7 +228,29 @@ pub struct Contract {
     tokens: IterableSet<AccountId>,
     orders: IterableMap<u64, Order>,
     accounts: LookupMap<AccountId, Account>,
+    /// user -> referrer, set once on the user's first order that names one.
+    referrers: LookupMap<AccountId, AccountId>,
+    /// Share of the protocol fee paid to the user's referrer (5000 = half).
+    referral_share_bps: u16,
 }
+
+/// State layout before referrals (v1, deployed until the referral upgrade).
+/// Only read by `migrate`; keep until every deployment has migrated.
+#[near(serializers = [borsh])]
+struct ContractV1 {
+    owner_id: AccountId,
+    ref_exchange_id: AccountId,
+    treasury_id: AccountId,
+    fee_bps: u16,
+    paused: bool,
+    next_order_id: u64,
+    keepers: IterableSet<AccountId>,
+    tokens: IterableSet<AccountId>,
+    orders: IterableMap<u64, Order>,
+    accounts: LookupMap<AccountId, Account>,
+}
+
+const DEFAULT_REFERRAL_SHARE_BPS: u16 = 5_000;
 
 fn now_sec() -> u64 {
     env::block_timestamp() / 1_000_000_000
@@ -280,6 +305,30 @@ impl Contract {
             tokens: IterableSet::new(StorageKey::Tokens),
             orders: IterableMap::new(StorageKey::Orders),
             accounts: LookupMap::new(StorageKey::Accounts),
+            referrers: LookupMap::new(StorageKey::Referrers),
+            referral_share_bps: DEFAULT_REFERRAL_SHARE_BPS,
+        }
+    }
+
+    /// One-time upgrade from the v1 layout: keeps every collection (same storage
+    /// prefixes) and adds referrals. Call via deploy + `migrate` in one transaction.
+    #[private]
+    #[init(ignore_state)]
+    pub fn migrate() -> Self {
+        let old: ContractV1 = env::state_read().unwrap_or_else(|| env::panic_str("No v1 state to migrate"));
+        Self {
+            owner_id: old.owner_id,
+            ref_exchange_id: old.ref_exchange_id,
+            treasury_id: old.treasury_id,
+            fee_bps: old.fee_bps,
+            paused: old.paused,
+            next_order_id: old.next_order_id,
+            keepers: old.keepers,
+            tokens: old.tokens,
+            orders: old.orders,
+            accounts: old.accounts,
+            referrers: LookupMap::new(StorageKey::Referrers),
+            referral_share_bps: DEFAULT_REFERRAL_SHARE_BPS,
         }
     }
 
@@ -528,11 +577,18 @@ impl Contract {
         // memes (~3.4e36 raw out), and a panic here would strand an already-executed swap.
         let fee = mul_div(amount_out, self.fee_bps as u128, BPS);
         let user_out = amount_out - fee;
-        if fee > 0 {
-            let treasury = self.treasury_id.clone();
-            self.credit(&treasury, &order.token_out, fee);
-        }
         let owner = order.owner_id.clone();
+        // Referrer's cut comes out of the protocol fee, never out of the user's output.
+        let referrer = self.referrers.get(&owner).cloned();
+        let referral_fee = match &referrer {
+            Some(_) => mul_div(fee, self.referral_share_bps as u128, BPS),
+            None => 0,
+        };
+        if let Some(r) = &referrer {
+            self.credit(r, &order.token_out, referral_fee);
+        }
+        let treasury = self.treasury_id.clone();
+        self.credit(&treasury, &order.token_out, fee - referral_fee);
         self.credit(&owner, &order.token_out, user_out);
 
         order.remaining_in = U128(order.remaining_in.0 - amount_in.0);
@@ -549,6 +605,8 @@ impl Contract {
                 "amount_in": amount_in,
                 "amount_out": U128(user_out),
                 "fee": U128(fee),
+                "referrer_id": referrer,
+                "referral_fee": U128(referral_fee),
             }),
         );
 
@@ -671,6 +729,25 @@ impl Contract {
             .detach();
         emit("withdraw_failed", json!({ "account_id": account_id, "token_id": token_id, "amount": amount }));
         false
+    }
+
+    // -------------------------------------------------------------- referrals
+
+    /// Bind the caller's referrer. Permanent and first-wins; only the user can set their
+    /// own (order messages are spoofable by malicious tokens, so they never bind).
+    /// Returns false (no panic) if already bound, so it's safe to batch into any tx.
+    pub fn set_referrer(&mut self, referrer_id: AccountId) -> bool {
+        let user = env::predecessor_account_id();
+        if referrer_id == user || self.referrers.contains_key(&user) {
+            return false;
+        }
+        self.referrers.insert(user.clone(), referrer_id.clone());
+        emit("referral_set", json!({ "account_id": user, "referrer_id": referrer_id }));
+        true
+    }
+
+    pub fn get_referrer(&self, account_id: AccountId) -> Option<AccountId> {
+        self.referrers.get(&account_id).cloned()
     }
 
     // ---------------------------------------------------------------- listing
@@ -852,6 +929,15 @@ impl Contract {
         self.owner_id = owner_id;
     }
 
+    /// Share of the protocol fee paid to referrers (5000 = half of the fee).
+    #[payable]
+    pub fn set_referral_share(&mut self, referral_share_bps: u16) {
+        assert_one_yocto();
+        self.assert_owner();
+        require!(referral_share_bps as u128 <= BPS, "Share cannot exceed 100% of the fee");
+        self.referral_share_bps = referral_share_bps;
+    }
+
     // ------------------------------------------------------------------ views
 
     pub fn get_config(&self) -> Config {
@@ -865,6 +951,7 @@ impl Contract {
             open_orders: self.orders.len(),
             min_account_storage: U128(MIN_ACCOUNT_STORAGE),
             order_storage: U128(ORDER_STORAGE),
+            referral_share_bps: self.referral_share_bps,
         }
     }
 
@@ -1208,6 +1295,91 @@ mod tests {
         let mut c = setup();
         ctx(accounts(0), 0, 1_000);
         c.set_fee(50, None);
+    }
+
+    #[test]
+    fn referrer_gets_half_the_fee() {
+        let mut c = setup();
+        ctx(accounts(1), 0, 1_000);
+        assert!(c.set_referrer(accounts(5)));
+        let id = create(
+            &mut c,
+            json!({"type":"limit","token_out":"blackdragon.tkn.near","min_amount_out":"1000000"}),
+            100,
+        );
+        ctx(accounts(3), 0, 1_001);
+        let _ = c.execute(id, vec![RouteHop { pool_id: 7, token_out: acc("blackdragon.tkn.near") }], None);
+        ctx(acc("readersexit.near"), 0, 1_001);
+        let out = c.on_executed(id, U128(100), accounts(3), Ok(U128(2_000_000)));
+        // 30 bps fee = 6000: user unchanged, referrer and treasury split the fee.
+        assert_eq!(out.0, 1_994_000);
+        assert_eq!(c.get_balances(accounts(1))[0].balance.0, 1_994_000);
+        assert_eq!(c.get_balances(accounts(5))[0].balance.0, 3_000);
+        assert_eq!(c.get_balances(accounts(0))[0].balance.0, 3_000);
+    }
+
+    #[test]
+    fn referral_binding_is_permanent_and_not_self() {
+        let mut c = setup();
+        ctx(accounts(1), 0, 1_000);
+        assert!(!c.set_referrer(accounts(1)), "self-referral ignored");
+        assert_eq!(c.get_referrer(accounts(1)), None);
+        assert!(c.set_referrer(accounts(5)));
+        assert!(!c.set_referrer(accounts(4)), "first referrer wins");
+        assert_eq!(c.get_referrer(accounts(1)), Some(accounts(5)));
+    }
+
+    #[test]
+    fn no_referrer_means_full_fee_to_treasury() {
+        let mut c = setup();
+        let id = create(
+            &mut c,
+            json!({"type":"limit","token_out":"blackdragon.tkn.near","min_amount_out":"1000000"}),
+            100,
+        );
+        ctx(accounts(3), 0, 1_001);
+        let _ = c.execute(id, vec![RouteHop { pool_id: 7, token_out: acc("blackdragon.tkn.near") }], None);
+        ctx(acc("readersexit.near"), 0, 1_001);
+        c.on_executed(id, U128(100), accounts(3), Ok(U128(2_000_000)));
+        assert_eq!(c.get_balances(accounts(0))[0].balance.0, 6_000);
+    }
+
+    #[test]
+    fn migrate_from_v1_keeps_state() {
+        ctx(acc("readersexit.near"), 0, 1_000);
+        let mut v1 = ContractV1 {
+            owner_id: accounts(0),
+            ref_exchange_id: acc("v2.ref-finance.near"),
+            treasury_id: acc("readersofee.near"),
+            fee_bps: 100,
+            paused: false,
+            next_order_id: 7,
+            keepers: IterableSet::new(StorageKey::Keepers),
+            tokens: IterableSet::new(StorageKey::Tokens),
+            orders: IterableMap::new(StorageKey::Orders),
+            accounts: LookupMap::new(StorageKey::Accounts),
+        };
+        v1.tokens.insert(acc("wrap.near"));
+        v1.keepers.insert(acc("keeper.skyto.near"));
+        let mut balances = BTreeMap::new();
+        balances.insert(acc("wrap.near"), 42u128);
+        v1.accounts.insert(accounts(1), Account { storage_deposit: MIN_ACCOUNT_STORAGE, order_ids: vec![], balances });
+        v1.tokens.flush();
+        v1.keepers.flush();
+        v1.accounts.flush();
+        env::state_write(&v1);
+
+        let c = Contract::migrate();
+        let cfg = c.get_config();
+        assert_eq!(cfg.owner_id, accounts(0));
+        assert_eq!(cfg.treasury_id, acc("readersofee.near"));
+        assert_eq!(cfg.fee_bps, 100);
+        assert_eq!(cfg.next_order_id, 7);
+        assert_eq!(cfg.referral_share_bps, 5_000);
+        assert_eq!(c.get_tokens(), vec![acc("wrap.near")]);
+        assert_eq!(c.get_keepers(), vec![acc("keeper.skyto.near")]);
+        assert_eq!(c.get_balances(accounts(1))[0].balance.0, 42);
+        assert_eq!(c.get_referrer(accounts(1)), None);
     }
 
     #[test]
