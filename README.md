@@ -42,14 +42,21 @@ The web app adds it automatically on the first order.
 
 ```bash
 cd contract
-cargo test                                   # 8 unit tests
-cargo near build non-reproducible-wasm       # -> target/near/readers_exit.wasm
+cargo test                                   # unit tests
+cargo near build reproducible-wasm           # verifiable build in Docker -> target/near/readers_exit.wasm
 ```
 
-On Windows:
-- Run tests with `AWS_LC_SYS_PREBUILT_NASM=1` (the test VM depends on aws-lc).
-- Build with `--no-abi`, because ABI generation can't link natively on MSVC.
+Deploy **only reproducible builds** to mainnet. They run inside the pinned
+`sourcescan/cargo-near` image in `Cargo.toml`. Anyone can rebuild the exact deployed
+wasm from the commit that `contract_source_metadata` points to. The build also embeds
+the ABI, so NearBlocks can show typed methods. Commit and push before building,
+because the metadata records the commit hash.
 
+On Windows, unit tests need `AWS_LC_SYS_PREBUILT_NASM=1`. Quick local
+`non-reproducible-wasm` builds also need `--no-abi`, because ABI generation can't link
+on MSVC (the Docker build doesn't have this problem).
+
+To verify on NearBlocks, go to the contract page, then **Contract Code → Verify and Publish**.
 ### Deploy
 
 ```powershell
